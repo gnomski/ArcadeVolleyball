@@ -4,13 +4,24 @@ using Photon.Pun;
 using Photon.Realtime;
 using TMPro;
 using ExitGames.Client.Photon;
+using System.Collections;
+using System.Linq;
+using System.Collections.Generic;
 
 public class LobbyManager : MonoBehaviourPunCallbacks, IOnEventCallback
 {
     [Header("Игровые элементы")]
-    [SerializeField] private TMP_InputField playerNameInput;
     [SerializeField] private Transform playersListContainer;
     [SerializeField] private GameObject playerEntryPrefab;
+    [SerializeField] private TMP_Text playerNameText;
+    [SerializeField] private Button changeNameButton;
+    [SerializeField] private TMP_Text currentRoomText;
+
+    [Header("Попап смены имени")]
+    [SerializeField] private GameObject nameChangePopup;
+    [SerializeField] private TMP_InputField nameInputField;
+    [SerializeField] private Button submitNameButton;
+    [SerializeField] private Button closePopupButton;
 
     [Header("Попап приглашения")]
     [SerializeField] private GameObject invitePopup;
@@ -25,6 +36,14 @@ public class LobbyManager : MonoBehaviourPunCallbacks, IOnEventCallback
 
     private const byte INVITE_EVENT = 1;
     private const byte DECLINE_EVENT = 2;
+    private const byte MOVE_TO_NEW_ROOM_EVENT = 3;
+
+    private List<RoomInfo> cachedRoomList = new List<RoomInfo>();
+
+    private int inviterId;
+
+    private bool isSwitchingRoom = false;
+    private string pendingRoomName;
 
     /// <summary>
     /// Инициализация лобби, подключение к Photon и настройка UI.
@@ -33,69 +52,94 @@ public class LobbyManager : MonoBehaviourPunCallbacks, IOnEventCallback
     {
         PhotonNetwork.AutomaticallySyncScene = true;
 
+        // Загружаем имя игрока из сохранений
+        string savedName = PlayerPrefs.GetString("PlayerName", "");
+        if (!string.IsNullOrEmpty(savedName))
+        {
+            PhotonNetwork.NickName = savedName;
+        }
+        else
+        {
+            PhotonNetwork.NickName = "Player" + Random.Range(1000, 9999);
+        }
+
         if (string.IsNullOrEmpty(PhotonNetwork.NickName))
             PhotonNetwork.NickName = "Player" + Random.Range(1000, 9999);
 
+        UpdatePlayerNameUI();
         PhotonNetwork.ConnectUsingSettings();
-        playerNameInput.onValueChanged.AddListener(delegate { OnNameChanged(); });
-
         PhotonNetwork.AddCallbackTarget(this);
 
         invitePopup.SetActive(false);
         declinePopup.SetActive(false);
+        nameChangePopup.SetActive(false);
+        submitNameButton.interactable = false;
 
         okButton.onClick.AddListener(HideDeclinePopup);
+        changeNameButton.onClick.AddListener(OpenNameChangePopup);
+        submitNameButton.onClick.AddListener(ChangePlayerName);
+        closePopupButton.onClick.AddListener(CloseNameChangePopup);
+        nameInputField.onValueChanged.AddListener(delegate { UpdateSubmitButtonState(); });
+
+        declineInviteButton.onClick.AddListener(() => DeclineInvite(inviterId));
+        acceptInviteButton.onClick.AddListener(() => AcceptInvite(inviterId));
+
+        UpdateRoomNameUI();
     }
 
     /// <summary>
-    /// Обработчик успешного подключения к Photon.
+    /// Обновляет название текущей комнаты в UI.
     /// </summary>
-    public override void OnConnectedToMaster()
+    private void UpdateRoomNameUI()
     {
-        PhotonNetwork.JoinOrCreateRoom("GlobalRoom", new RoomOptions { MaxPlayers = 20 }, TypedLobby.Default);
+        if (currentRoomText != null)
+        {
+            if (PhotonNetwork.CurrentRoom != null)
+            {
+                currentRoomText.text = $"Комната: {PhotonNetwork.CurrentRoom.Name}";
+            }
+            else
+            {
+                currentRoomText.text = ""; // Очистка текста, если комната не задана
+            }
+        }
     }
 
-    /// <summary>
-    /// Обработчик входа в комнату. Устанавливает имя игрока и обновляет список.
-    /// </summary>
-    public override void OnJoinedRoom()
+    private void OpenNameChangePopup()
     {
+        nameInputField.text = PhotonNetwork.NickName;
+        nameChangePopup.SetActive(true);
+        UpdateSubmitButtonState();
+    }
+
+    private void CloseNameChangePopup()
+    {
+        nameChangePopup.SetActive(false);
+    }
+
+    private void UpdateSubmitButtonState()
+    {
+        submitNameButton.interactable = !string.IsNullOrEmpty(nameInputField.text);
+    }
+
+    private void ChangePlayerName()
+    {
+        string newName = nameInputField.text;
+        PhotonNetwork.NickName = newName;
+
+        PlayerPrefs.SetString("PlayerName", newName);
+        PlayerPrefs.Save();
+
         SetPlayerName();
-        UpdateRoomPlayers();
+        UpdatePlayerNameUI();
+        CloseNameChangePopup();
     }
 
-    /// <summary>
-    /// Обновление списка игроков при входе нового игрока в комнату.
-    /// </summary>
-    public override void OnPlayerEnteredRoom(Player newPlayer)
+    private void UpdatePlayerNameUI()
     {
-        UpdateRoomPlayers();
+        playerNameText.text = PhotonNetwork.NickName;
     }
 
-    /// <summary>
-    /// Обновление списка игроков при выходе игрока из комнаты.
-    /// </summary>
-    public override void OnPlayerLeftRoom(Player otherPlayer)
-    {
-        UpdateRoomPlayers();
-    }
-
-    /// <summary>
-    /// Обновляет имя игрока при его изменении в UI.
-    /// </summary>
-    private void OnNameChanged()
-    {
-        if (!PhotonNetwork.IsConnected || string.IsNullOrEmpty(playerNameInput.text))
-            return;
-
-        PhotonNetwork.NickName = playerNameInput.text;
-        SetPlayerName();
-        UpdateRoomPlayers();
-    }
-
-    /// <summary>
-    /// Устанавливает имя игрока в кастомные свойства Photon.
-    /// </summary>
     private void SetPlayerName()
     {
         ExitGames.Client.Photon.Hashtable props = new ExitGames.Client.Photon.Hashtable();
@@ -103,9 +147,71 @@ public class LobbyManager : MonoBehaviourPunCallbacks, IOnEventCallback
         PhotonNetwork.LocalPlayer.SetCustomProperties(props);
     }
 
-    /// <summary>
-    /// Обновляет список игроков в лобби, создавая UI-элементы для каждого игрока.
-    /// </summary>
+    public override void OnRoomListUpdate(List<RoomInfo> roomList)
+    {
+        cachedRoomList = roomList;
+    }
+
+    public override void OnConnectedToMaster()
+    {
+        PhotonNetwork.JoinLobby();
+    }
+
+    public override void OnLeftRoom()
+    {
+        Debug.Log("Вышли из комнаты, заходим в лобби.");
+        PhotonNetwork.JoinLobby();
+    }
+
+    public override void OnJoinedLobby()
+    {
+        if (isSwitchingRoom && !string.IsNullOrEmpty(pendingRoomName))
+        {
+            PhotonNetwork.JoinOrCreateRoom(pendingRoomName, new RoomOptions { MaxPlayers = 2 }, TypedLobby.Default);
+            isSwitchingRoom = false;
+            pendingRoomName = null;
+        }
+        else
+        {
+            PhotonNetwork.JoinOrCreateRoom("GlobalRoom", new RoomOptions { MaxPlayers = 20 }, TypedLobby.Default);
+        }
+    }
+
+    public override void OnPlayerPropertiesUpdate(Player targetPlayer, ExitGames.Client.Photon.Hashtable changedProps)
+    {
+        if (changedProps.ContainsKey("PlayerName"))
+        {
+            UpdateRoomPlayers();
+        }
+    }
+
+    public override void OnJoinedRoom()
+    {
+        SetPlayerName();
+        UpdateRoomPlayers();
+        UpdateRoomNameUI();
+        Debug.Log($"Вошли в комнату: {PhotonNetwork.CurrentRoom.Name}");
+
+        if (PhotonNetwork.CurrentRoom.Name.StartsWith("Match_") && PhotonNetwork.CurrentRoom.PlayerCount == 2)
+        {
+            PhotonNetwork.LoadLevel("GameScene");
+        }
+    }
+
+    public override void OnPlayerEnteredRoom(Player newPlayer)
+    {
+        UpdateRoomPlayers();
+        if (PhotonNetwork.CurrentRoom.Name.StartsWith("Match_") && PhotonNetwork.CurrentRoom.PlayerCount == 2)
+        {
+            PhotonNetwork.LoadLevel("GameScene");
+        }
+    }
+
+    public override void OnPlayerLeftRoom(Player otherPlayer)
+    {
+        UpdateRoomPlayers();
+    }
+
     private void UpdateRoomPlayers()
     {
         foreach (Transform child in playersListContainer)
@@ -113,7 +219,9 @@ public class LobbyManager : MonoBehaviourPunCallbacks, IOnEventCallback
 
         foreach (var player in PhotonNetwork.PlayerList)
         {
-            string playerName = player.CustomProperties.ContainsKey("PlayerName") ? (string)player.CustomProperties["PlayerName"] : "Unknown";
+            string playerName = player.CustomProperties.ContainsKey("PlayerName")
+                ? (string)player.CustomProperties["PlayerName"]
+                : "Unknown";
 
             GameObject entry = Instantiate(playerEntryPrefab, playersListContainer);
             entry.transform.Find("PlayerNameText").GetComponent<TMP_Text>().text = playerName;
@@ -130,9 +238,6 @@ public class LobbyManager : MonoBehaviourPunCallbacks, IOnEventCallback
         }
     }
 
-    /// <summary>
-    /// Отправляет приглашение другому игроку.
-    /// </summary>
     private void SendInvite(Player targetPlayer)
     {
         object[] content = new object[] { PhotonNetwork.NickName, PhotonNetwork.LocalPlayer.ActorNumber };
@@ -140,11 +245,9 @@ public class LobbyManager : MonoBehaviourPunCallbacks, IOnEventCallback
         SendOptions sendOptions = new SendOptions { Reliability = true };
 
         PhotonNetwork.RaiseEvent(INVITE_EVENT, content, options, sendOptions);
+        inviterId = targetPlayer.ActorNumber; // Сохраняем ID приглашённого
     }
 
-    /// <summary>
-    /// Обрабатывает сетевые события Photon (приглашение и отказ).
-    /// </summary>
     public void OnEvent(EventData photonEvent)
     {
         if (photonEvent.Code == INVITE_EVENT)
@@ -162,21 +265,30 @@ public class LobbyManager : MonoBehaviourPunCallbacks, IOnEventCallback
 
             ShowDeclinePopup(playerName);
         }
+        else if (photonEvent.Code == MOVE_TO_NEW_ROOM_EVENT)
+        {
+            object[] data = (object[])photonEvent.CustomData;
+            string matchRoom = (string)data[0];
+
+            Debug.Log($"Получена команда войти в {matchRoom}");
+
+            pendingRoomName = matchRoom;
+            isSwitchingRoom = true;
+
+            PhotonNetwork.LeaveRoom();
+        }
     }
 
-    /// <summary>
-    /// Показывает попап с приглашением принять матч.
-    /// </summary>
     private void ShowInvitePopup(string inviterName, int inviterId)
     {
         inviteText.text = $"{inviterName} приглашает вас в матч!";
         invitePopup.SetActive(true);
 
         acceptInviteButton.onClick.RemoveAllListeners();
-        acceptInviteButton.onClick.AddListener(() => AcceptInvite(inviterId));
-
         declineInviteButton.onClick.RemoveAllListeners();
+
         declineInviteButton.onClick.AddListener(() => DeclineInvite(inviterId));
+        acceptInviteButton.onClick.AddListener(() => AcceptInvite(inviterId));
     }
 
     /// <summary>
@@ -193,44 +305,86 @@ public class LobbyManager : MonoBehaviourPunCallbacks, IOnEventCallback
         PhotonNetwork.RaiseEvent(DECLINE_EVENT, content, options, sendOptions);
     }
 
-    /// <summary>
-    /// Показывает попап отказа от приглашения.
-    /// </summary>
     private void ShowDeclinePopup(string playerName)
     {
         declineText.text = $"{playerName} отклонил ваше приглашение";
         declinePopup.SetActive(true);
     }
 
-    /// <summary>
-    /// Закрывает попап отказа.
-    /// </summary>
     private void HideDeclinePopup()
     {
-        foreach (Transform child in declinePopup.transform)
-        {
-            child.gameObject.SetActive(false);
-        }
-
         declinePopup.SetActive(false);
     }
 
+    private void OnDestroy()
+    {
+        PhotonNetwork.RemoveCallbackTarget(this);
+    }
+
     /// <summary>
-    /// Принимает приглашение и переводит игроков в новую комнату.
+    /// Принимает приглашение и запрашивает номер новой комнаты.
     /// </summary>
     private void AcceptInvite(int inviterId)
     {
         invitePopup.SetActive(false);
-        string matchRoom = $"Match_{inviterId}_{PhotonNetwork.LocalPlayer.ActorNumber}";
-        PhotonNetwork.LeaveRoom();
-        PhotonNetwork.JoinOrCreateRoom(matchRoom, new RoomOptions { MaxPlayers = 2 }, TypedLobby.Default);
+        this.inviterId = inviterId;
+
+        StartCoroutine(FindNextMatchRoom());
     }
 
     /// <summary>
-    /// Удаляет объект из списка сетевых обработчиков при выходе из сцены.
+    /// Запрашивает номер первой свободной комнаты `Match_X`.
     /// </summary>
-    private void OnDestroy()
+    private IEnumerator FindNextMatchRoom()
     {
-        PhotonNetwork.RemoveCallbackTarget(this);
+        Debug.Log("Начали поиск комнаты...");
+
+        yield return new WaitForSeconds(1f); // ждем немного, чтобы список комнат успел прийти от Photon
+
+        int matchNumber = 1;
+        string matchRoom;
+
+        while (true)
+        {
+            matchRoom = $"Match_{matchNumber}";
+
+            if (cachedRoomList.Any(room => room.Name == matchRoom))
+                matchNumber++;
+            else
+                break;
+        }
+
+        MovePlayersToRoom(matchRoom); ;
+    }
+
+    /// <summary>
+    /// Переносит обоих игроков в новую комнату.
+    /// </summary>
+    private void MovePlayersToRoom(string matchRoom)
+    {
+        Debug.Log($"Создаём новую комнату: {matchRoom}");
+
+        object[] content = new object[] { matchRoom };
+        RaiseEventOptions options = new RaiseEventOptions { TargetActors = new int[] { inviterId } };
+        SendOptions sendOptions = new SendOptions { Reliability = true };
+        PhotonNetwork.RaiseEvent(MOVE_TO_NEW_ROOM_EVENT, content, options, sendOptions);
+
+        isSwitchingRoom = true;
+        pendingRoomName = matchRoom;
+
+        PhotonNetwork.LeaveRoom();
+    }
+
+    /// <summary>
+    /// Ждём выхода из комнаты и заходим в новую комнату.
+    /// </summary>
+    private IEnumerator JoinNewRoomWhenReady(string matchRoom)
+    {
+        while (PhotonNetwork.InRoom)
+        {
+            yield return null;
+        }
+
+        PhotonNetwork.JoinOrCreateRoom(matchRoom, new RoomOptions { MaxPlayers = 2 }, TypedLobby.Default);
     }
 }
